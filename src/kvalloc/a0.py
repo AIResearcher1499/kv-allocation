@@ -98,7 +98,7 @@ def pick_device(arg: str = "auto") -> str:
     return "cpu"
 
 
-def train_one(rc: RunConfig, device: str):
+def train_one(rc: RunConfig, device: str, log_every: int = 0):
     torch.manual_seed(rc.seed)
     cfg = ModelConfig(dim=rc.dim, n_kv_heads=rc.n_kv, kv_layers=rc.kv_layers)
     model = KVModel(cfg).to(device)
@@ -115,6 +115,7 @@ def train_one(rc: RunConfig, device: str):
     gen = torch.Generator().manual_seed(rc.seed)
     model.train()
     first_loss = last_loss = None
+    t0 = time.time()
     for step in range(rc.steps):
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
@@ -129,6 +130,12 @@ def train_one(rc: RunConfig, device: str):
         if first_loss is None:
             first_loss = loss.item()
         last_loss = loss.item()
+        if log_every and (step % log_every == 0 or step == rc.steps - 1):
+            with torch.no_grad():
+                acc = query_accuracy(logits, y)
+            el = time.time() - t0
+            print(f"    step {step:6d}/{rc.steps} loss {last_loss:6.3f} "
+                  f"batch_acc {acc:.3f} {el:6.0f}s", flush=True)
     return model, first_loss, last_loss
 
 
@@ -161,14 +168,19 @@ def load_done_keys(path: str):
     return done
 
 
-def run(plan, out_path: str, device: str):
+def run(plan, out_path: str, device: str, log_every: int = 0):
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     done = load_done_keys(out_path)
     todo = [rc for rc in plan if rc.key() not in done]
-    print(f"plan={len(plan)} done={len(done)} todo={len(todo)} device={device}")
+    print(f"plan={len(plan)} done={len(done)} todo={len(todo)} device={device}",
+          flush=True)
     for i, rc in enumerate(todo):
+        if log_every:
+            print(f"[{i + 1}/{len(todo)}] START {rc.dim}d nkv={rc.n_kv} "
+                  f"kvl={rc.kv_layers} L{rc.seq_len} N{rc.num_pairs} "
+                  f"lr={rc.lr:.1e} steps={rc.steps}", flush=True)
         t0 = time.time()
-        model, first_loss, last_loss = train_one(rc, device)
+        model, first_loss, last_loss = train_one(rc, device, log_every=log_every)
         evals = eval_grid(model, rc, device)
         rec = {
             "config": asdict(rc),
@@ -266,6 +278,8 @@ def main(argv=None):
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--analyse", action="store_true")
+    p.add_argument("--log-every", type=int, default=1000,
+                   help="in-run progress line every N steps (0 = silent)")
     args = p.parse_args(argv)
 
     if args.analyse:
@@ -278,7 +292,7 @@ def main(argv=None):
         if args.dry_run:
             print(f"{len(plan)} calibration runs -> {out}")
             return
-        run(plan, out, pick_device(args.device))
+        run(plan, out, pick_device(args.device), log_every=args.log_every)
         return
 
     if args.smoke:
@@ -295,7 +309,7 @@ def main(argv=None):
         for rc in plan[:5]:
             print(" ", rc.key())
         return
-    run(plan, out, pick_device(args.device))
+    run(plan, out, pick_device(args.device), log_every=args.log_every)
 
 
 if __name__ == "__main__":
