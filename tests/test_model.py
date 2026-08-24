@@ -55,6 +55,15 @@ class TestKVModel(unittest.TestCase):
         # single owner layer 0; store holds exactly one entry
         self.assertEqual(set(m._debug_kv.keys()), {0})
 
+    def test_learned_pos_and_dropout_forward(self):
+        m = KVModel(ModelConfig(64, pos="learned", dropout=0.1, max_seq_len=128))
+        self.assertIsNotNone(m.pos_embed)
+        m.eval()  # dropout off in eval; forward must be deterministic
+        x = torch.randint(0, 8192, (2, 32))
+        self.assertTrue(torch.equal(m(x), m(x)))
+        with self.assertRaises(ValueError):
+            ModelConfig(64, pos="alibi")
+
     def test_forward_shapes_all_doses(self):
         for n_kv in (8, 2, 1):
             for kvl in (4, 2, 1):

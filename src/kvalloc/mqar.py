@@ -1,17 +1,21 @@
-"""MQAR task generator (Zoology arXiv:2312.04927 Def 3.1 style).
+"""MQAR task, faithful to the Zoology reference implementation.
 
-Sequence layout (length L, N key-value pairs, N queries):
+Mirrors zoology/data/multiquery_ar.py (repo HazyResearch/zoology @1ad20d1):
 
-    [k_1 v_1 ... k_N v_N | filler ... | q_(s1) a_(s1) ... q_(sN) a_(sN)]
+    Key Val Key Val | Query .. Query ..     (length L after next-token shift)
+    2   8   4   7   | 4  0  0  2  0  ...
+    labels: -100 except AT each query-key position, where the label is the
+    paired value (next-token convention after the [:-1]/[1:] shift).
 
-Keys are distinct within a sequence; queries are the same keys in a random
-order; the training target at each query position is the paired value (the
-value token also appears at the next input position, i.e. teacher forcing —
-causality prevents leakage into its own prediction). Loss/accuracy are
-computed on query positions only. The filler gap pushes key→query distance
-toward L, which is the capacity/range stress the gate needs.
+- keys drawn WITHOUT replacement from [1, V/2); values WITHOUT replacement
+  from [V/2, V) — both per example.
+- KV pairs packed contiguously at the START of the sequence.
+- Query gaps drawn from a power law p(g) ∝ (g+1)^(power_a - 1) over the tail
+  region; power_a=0.01 (Zoology default) puts queries close after the context.
+  power_a=1.0 is uniform — the distance-stress knob for later stages.
+- Fillers stay token 0 (random_non_queries=False, the ICLR figure-2 setting).
 
-Valid cells require 4*N <= L (pairs + queries leave a non-negative gap).
+Valid cells require 4*N <= L (context 2N + tail >= 2N).
 """
 
 import torch
@@ -19,44 +23,47 @@ import torch
 VOCAB = 8192
 FILLER = 0
 IGNORE = -100
-N_KEYS = 4095          # key ids: 1..4095
-VALUE_LO = N_KEYS + 1  # value ids: 4096..8191
+KEY_LO, KEY_HI = 1, VOCAB // 2      # keys: 1..4095
+VAL_LO, VAL_HI = VOCAB // 2, VOCAB  # values: 4096..8191
+POWER_A = 0.01
 
 
 def is_valid_cell(seq_len: int, num_pairs: int) -> bool:
     return 4 * num_pairs <= seq_len
 
 
-def build_batch(batch: int, seq_len: int, num_pairs: int,
-                generator: torch.Generator, device: str = "cpu"):
-    """Returns (inputs, targets), both (batch, seq_len) int64 on `device`.
+def _distinct(batch: int, lo: int, hi: int, n: int, gen: torch.Generator):
+    r = torch.rand(batch, hi - lo, generator=gen)
+    return r.argsort(dim=1)[:, :n] + lo
 
-    targets == IGNORE everywhere except query positions.
-    """
+
+def build_examples(num: int, seq_len: int, num_pairs: int,
+                   generator: torch.Generator, power_a: float = POWER_A):
+    """Returns (inputs, labels), both (num, seq_len) int64 on CPU."""
     if not is_valid_cell(seq_len, num_pairs):
         raise ValueError(f"invalid cell: 4*{num_pairs} > {seq_len}")
 
-    # Distinct keys per row via argsort-of-uniform.
-    r = torch.rand(batch, N_KEYS, generator=generator)
-    keys = r.argsort(dim=1)[:, :num_pairs] + 1
-    values = torch.randint(VALUE_LO, VOCAB, (batch, num_pairs), generator=generator)
+    n, ctx = num_pairs, 2 * num_pairs
+    keys = _distinct(num, KEY_LO, KEY_HI, n, generator)
+    values = _distinct(num, VAL_LO, VAL_HI, n, generator)
 
-    perm = torch.rand(batch, num_pairs, generator=generator).argsort(dim=1)
-    q_keys = torch.gather(keys, 1, perm)
-    q_vals = torch.gather(values, 1, perm)
+    ex = torch.full((num, seq_len + 1), FILLER, dtype=torch.long)
+    ex[:, 0:ctx:2] = keys
+    ex[:, 1:ctx:2] = values
 
-    inputs = torch.full((batch, seq_len), FILLER, dtype=torch.long)
-    targets = torch.full((batch, seq_len), IGNORE, dtype=torch.long)
+    space = (seq_len - ctx) // 2
+    g = torch.arange(1, space + 1, dtype=torch.float64)
+    p = (power_a * g ** (power_a - 1))
+    gaps = torch.multinomial((p / p.sum()).expand(num, -1), n,
+                             replacement=False, generator=generator)
 
-    inputs[:, 0:2 * num_pairs:2] = keys
-    inputs[:, 1:2 * num_pairs:2] = values
+    labels = torch.full((num, seq_len + 1), IGNORE, dtype=torch.long)
+    # query key at tail offset 2*gap; its value is the NEXT-token label
+    q_pos = ctx + 2 * gaps          # in [ctx, seq_len-1] since gap < space
+    ex.scatter_(1, q_pos, keys)
+    labels.scatter_(1, q_pos + 1, values)
 
-    qs = seq_len - 2 * num_pairs
-    inputs[:, qs::2] = q_keys
-    inputs[:, qs + 1::2] = q_vals
-    targets[:, qs::2] = q_vals
-
-    return inputs.to(device), targets.to(device)
+    return ex[:, :-1].contiguous(), labels[:, 1:].contiguous()
 
 
 def query_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:

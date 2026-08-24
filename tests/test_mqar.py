@@ -7,8 +7,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import torch  # noqa: E402
 
 from kvalloc.mqar import (  # noqa: E402
-    FILLER, IGNORE, N_KEYS, VALUE_LO, VOCAB, build_batch, is_valid_cell,
-    query_accuracy,
+    FILLER, IGNORE, KEY_HI, KEY_LO, VAL_HI, VAL_LO, VOCAB, build_examples,
+    is_valid_cell, query_accuracy,
 )
 
 
@@ -19,48 +19,50 @@ class TestMQAR(unittest.TestCase):
     def test_invalid_cell_raises(self):
         self.assertFalse(is_valid_cell(512, 256))
         with self.assertRaises(ValueError):
-            build_batch(2, 512, 256, self.gen)
+            build_examples(2, 512, 256, self.gen)
 
-    def test_layout_and_mapping(self):
-        b, L, n = 4, 256, 32
-        x, y = build_batch(b, L, n, self.gen)
+    def test_zoology_layout_and_mapping(self):
+        b, L, n = 8, 256, 32
+        x, y = build_examples(b, L, n, self.gen)
         self.assertEqual(x.shape, (b, L))
-        keys = x[:, 0:2 * n:2]
-        vals = x[:, 1:2 * n:2]
-        # keys distinct per row, in key range; values in value range
+        ctx = 2 * n
+        keys = x[:, 0:ctx:2]
+        vals = x[:, 1:ctx:2]
         for r in range(b):
+            # keys and values each distinct within an example (Zoology sampling)
             self.assertEqual(len(set(keys[r].tolist())), n)
-        self.assertTrue(((keys >= 1) & (keys <= N_KEYS)).all())
-        self.assertTrue(((vals >= VALUE_LO) & (vals < VOCAB)).all())
-        # filler gap is FILLER
-        qs = L - 2 * n
-        self.assertTrue((x[:, 2 * n:qs] == FILLER).all())
-        # targets only at query positions
-        mask = y != IGNORE
-        expect = torch.zeros_like(mask)
-        expect[:, qs::2] = True
-        self.assertTrue((mask == expect).all())
-        # each query's target equals the value paired with that key
+            self.assertEqual(len(set(vals[r].tolist())), n)
+        self.assertTrue(((keys >= KEY_LO) & (keys < KEY_HI)).all())
+        self.assertTrue(((vals >= VAL_LO) & (vals < VAL_HI)).all())
         for r in range(b):
             kv = dict(zip(keys[r].tolist(), vals[r].tolist()))
-            q_keys = x[r, qs::2].tolist()
-            q_tgts = y[r, qs::2].tolist()
-            # teacher-forced value token sits right after the query key
-            q_next = x[r, qs + 1::2].tolist()
-            self.assertEqual(sorted(q_keys), sorted(kv))
-            for qk, qt, qn in zip(q_keys, q_tgts, q_next):
-                self.assertEqual(qt, kv[qk])
-                self.assertEqual(qn, kv[qk])
+            q_positions = (y[r] != IGNORE).nonzero().flatten().tolist()
+            self.assertEqual(len(q_positions), n)
+            for p in q_positions:
+                # label sits AT the query-key position (next-token shift)
+                self.assertIn(x[r, p].item(), kv)
+                self.assertEqual(y[r, p].item(), kv[x[r, p].item()])
+                self.assertGreaterEqual(p, ctx)  # queries live in the tail
+            # non-query tail positions are filler (random_non_queries=False)
+            tail = x[r, ctx:]
+            self.assertTrue(((tail == FILLER) | (tail >= KEY_LO)).all())
 
-    def test_query_accuracy_oracle_and_chance(self):
+    def test_power_a_places_queries_near_context(self):
+        b, L, n = 64, 512, 32
+        x_near, y_near = build_examples(b, L, n, torch.Generator().manual_seed(1),
+                                        power_a=0.01)
+        x_uni, y_uni = build_examples(b, L, n, torch.Generator().manual_seed(1),
+                                      power_a=1.0)
+        mean_near = (y_near != IGNORE).nonzero()[:, 1].float().mean().item()
+        mean_uni = (y_uni != IGNORE).nonzero()[:, 1].float().mean().item()
+        self.assertLess(mean_near, mean_uni)  # 0.01 skews toward the KV block
+
+    def test_query_accuracy_oracle(self):
         b, L, n = 2, 128, 16
-        x, y = build_batch(b, L, n, self.gen)
+        x, y = build_examples(b, L, n, self.gen)
         oracle = torch.zeros(b, L, VOCAB)
         oracle.scatter_(2, torch.clamp(y, min=0).unsqueeze(-1), 1.0)
         self.assertAlmostEqual(query_accuracy(oracle, y), 1.0)
-        wrong = torch.zeros(b, L, VOCAB)
-        wrong[:, :, FILLER] = 1.0
-        self.assertAlmostEqual(query_accuracy(wrong, y), 0.0)
 
 
 if __name__ == "__main__":

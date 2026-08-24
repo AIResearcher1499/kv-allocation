@@ -24,8 +24,14 @@ class ModelConfig:
     n_kv_heads: int = 8
     kv_layers: int = 4
     vocab: int = 8192
+    pos: str = "rope"        # "rope" (A-1 LM) | "learned" (A-0 instrument,
+                             # matching Zoology's absolute embeddings)
+    max_seq_len: int = 4096  # learned-APE table size
+    dropout: float = 0.0     # embed + attention dropout (Zoology uses 0.1)
 
     def __post_init__(self):
+        if self.pos not in ("rope", "learned"):
+            raise ValueError(f"unknown pos: {self.pos}")
         if self.n_heads % self.n_kv_heads:
             raise ValueError("n_kv_heads must divide n_heads")
         if self.n_layers % self.kv_layers:
@@ -85,10 +91,15 @@ class Block(nn.Module):
 
     def forward(self, x, kv_store):
         cfg = self.cfg
+        use_rope = cfg.pos == "rope"
         h = self.ln1(x)
-        q = _rope(self._heads(self.wq(h), cfg.n_heads))
+        q = self._heads(self.wq(h), cfg.n_heads)
+        if use_rope:
+            q = _rope(q)
         if self.owns_kv:
-            k = _rope(self._heads(self.wk(h), cfg.n_kv_heads))
+            k = self._heads(self.wk(h), cfg.n_kv_heads)
+            if use_rope:
+                k = _rope(k)
             v = self._heads(self.wv(h), cfg.n_kv_heads)
             kv_store[self.layer_idx] = (k, v)
         else:
@@ -97,7 +108,9 @@ class Block(nn.Module):
         if rep > 1:
             k = k.repeat_interleave(rep, dim=1)
             v = v.repeat_interleave(rep, dim=1)
-        att = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        drop = cfg.dropout if self.training else 0.0
+        att = F.scaled_dot_product_attention(q, k, v, is_causal=True,
+                                             dropout_p=drop)
         att = att.transpose(1, 2).reshape(x.shape)
         x = x + self.wo(att)
         return x + self.mlp(self.ln2(x))
@@ -108,6 +121,9 @@ class KVModel(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.embed = nn.Embedding(cfg.vocab, cfg.dim)
+        self.pos_embed = (nn.Embedding(cfg.max_seq_len, cfg.dim)
+                          if cfg.pos == "learned" else None)
+        self.embed_drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.n_layers))
         self.ln_f = nn.LayerNorm(cfg.dim)
         self.head = nn.Linear(cfg.dim, cfg.vocab, bias=False)
@@ -129,6 +145,10 @@ class KVModel(nn.Module):
 
     def forward(self, idx, debug_kv: bool = False):
         x = self.embed(idx)
+        if self.pos_embed is not None:
+            pos = torch.arange(idx.size(1), device=idx.device)
+            x = x + self.pos_embed(pos)[None]
+        x = self.embed_drop(x)
         kv_store = {}
         for blk in self.blocks:
             x = blk(x, kv_store)

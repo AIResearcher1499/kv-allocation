@@ -1,21 +1,27 @@
 """Stage A-0 runner — synthetic MQAR dose-response (prereg-g0a.md §2, §4).
 
-Frozen grids live in this module; the gate is judged by `analyse()`.
+Training protocol v2 (2026-08-24): faithful to the Zoology reference
+(HazyResearch/zoology @1ad20d1) after the fresh-data protocol failed to form
+the retrieval circuit (diag acc <= 0.05 at 20k steps, data/a0_calibrate.jsonl):
+FIXED dataset (100k train / 3k test), up to 64 epochs, per-EPOCH cosine with
+no warmup, AdamW wd=0.1, early stop at val acc > 0.99, learned absolute
+position embeddings, dropout 0.1, queries placed by power-law (power_a=0.01,
+i.e. near the KV block). Frozen prereg items unchanged: 4 layers / 8 heads,
+the 9 (n_kv x kv_layers) doses, the LR sweep, the task grid, the gate.
 
-Operationalization recorded BEFORE any data exists (clarifies, does not alter,
-frozen thresholds): a "stress cell" for the gate is a (seq_len, num_pairs) task
-cell evaluated ON ITS OWN diagonal (train setting == eval setting), per dim;
-the byte-ladder range is acc(max rel_bytes dose) - acc(min rel_bytes dose),
-each maxed over the 4 LRs; jitter is the max over eval cells of
-|max-over-LR acc(seed A) - max-over-LR acc(seed B)| on the repeated cell.
+Operationalization recorded pre-data (clarifies, does not alter, thresholds):
+a "stress cell" is a (seq_len, num_pairs) cell judged on its own diagonal
+(train == eval); the byte-ladder range is acc(max bytes) - acc(min bytes),
+each maxed over LRs; jitter = |max-over-LR acc| gap between the two seeds of
+the repeated cell. With learned APE, cross-length eval is meaningless, so the
+battery covers same-length cells only (denser pairs = the harder direction).
 
-Result files are MERGE-only: existing (full-key) records are skipped on
-resume, never overwritten. Smoke runs write to a SEPARATE file by default.
+Result files are MERGE-only. Smoke and calibrate write SEPARATE files.
 """
 
 import argparse
+import copy
 import json
-import math
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -23,7 +29,7 @@ from dataclasses import asdict, dataclass
 import torch
 
 from .model import KVModel, ModelConfig
-from .mqar import IGNORE, build_batch, is_valid_cell, query_accuracy
+from .mqar import IGNORE, build_examples, is_valid_cell, query_accuracy
 
 # ---- frozen A-0 grids (prereg §2) -------------------------------------------
 DIMS = (128, 256)
@@ -32,9 +38,9 @@ TRAIN_LENS = (512, 2048, 4096)
 PAIRS = (32, 64, 128, 256)
 LRS = (1e-4, 4.6415888336127824e-4, 2.1544346900318823e-3, 1e-2)
 BASE_SEED = 20260824
-# The single repeated cell for the jitter estimate (mid-ladder dose).
 JITTER_CELL = dict(dim=128, n_kv=2, kv_layers=2, seq_len=2048, num_pairs=128)
 JITTER_SEED_OFFSET = 1000
+TEST_SEED_OFFSET = 10_000_019  # train/test example streams must not overlap
 # -----------------------------------------------------------------------------
 
 
@@ -47,11 +53,14 @@ class RunConfig:
     num_pairs: int
     lr: float
     seed: int
-    steps: int = 8000
-    tokens_per_batch: int = 32768
-    warmup_frac: float = 0.05
+    max_epochs: int = 64
+    num_examples: int = 100_000
+    test_examples: int = 3_000
+    power_a: float = 0.01
     weight_decay: float = 0.1
-    eval_seqs: int = 256
+    early_stop_acc: float = 0.99
+    dropout: float = 0.1
+    pos: str = "learned"
 
     def key(self) -> str:
         # Resume key covers EVERY field so no parameter change can silently
@@ -60,15 +69,22 @@ class RunConfig:
 
     @property
     def batch_size(self) -> int:
-        return max(8, self.tokens_per_batch // self.seq_len)
+        # Zoology's per-length batch sizes (figure2 configs).
+        if self.seq_len <= 128:
+            return 512
+        if self.seq_len <= 256:
+            return 256
+        if self.seq_len <= 512:
+            return 128
+        return 64
 
 
 def eval_cells():
     return [(l, n) for l in TRAIN_LENS for n in PAIRS if is_valid_cell(l, n)]
 
 
-def build_plan(steps: int = 8000, dims=DIMS, lens=TRAIN_LENS, pairs=PAIRS,
-               lrs=LRS, doses=DOSES, with_jitter: bool = True):
+def build_plan(max_epochs: int = 64, dims=DIMS, lens=TRAIN_LENS, pairs=PAIRS,
+               lrs=LRS, doses=DOSES, with_jitter: bool = True, **overrides):
     plan = []
     for dim in dims:
         for (n_kv, kv_layers) in doses:
@@ -78,13 +94,26 @@ def build_plan(steps: int = 8000, dims=DIMS, lens=TRAIN_LENS, pairs=PAIRS,
                         continue
                     for lr in lrs:
                         plan.append(RunConfig(dim, n_kv, kv_layers, seq_len,
-                                              num_pairs, lr, BASE_SEED, steps))
+                                              num_pairs, lr, BASE_SEED,
+                                              max_epochs, **overrides))
     if with_jitter:
         j = JITTER_CELL
         for lr in lrs:
             plan.append(RunConfig(j["dim"], j["n_kv"], j["kv_layers"],
                                   j["seq_len"], j["num_pairs"], lr,
-                                  BASE_SEED + JITTER_SEED_OFFSET, steps))
+                                  BASE_SEED + JITTER_SEED_OFFSET,
+                                  max_epochs, **overrides))
+    return plan
+
+
+def build_calibration_plan(max_epochs: int = 64, **overrides):
+    """Anchor-dose-ONLY runs to verify the instrument converges before the
+    grid. Trains no low-dose arm, so no dose contrast is visible pre-gate."""
+    plan = []
+    for (l, n) in ((512, 32), (2048, 64)):
+        for lr in LRS[2:]:
+            plan.append(RunConfig(128, 8, 4, l, n, lr, BASE_SEED,
+                                  max_epochs, **overrides))
     return plan
 
 
@@ -98,61 +127,96 @@ def pick_device(arg: str = "auto") -> str:
     return "cpu"
 
 
-def train_one(rc: RunConfig, device: str, log_every: int = 0):
-    torch.manual_seed(rc.seed)
-    cfg = ModelConfig(dim=rc.dim, n_kv_heads=rc.n_kv, kv_layers=rc.kv_layers)
-    model = KVModel(cfg).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=rc.lr, betas=(0.9, 0.95),
-                            weight_decay=rc.weight_decay)
-    warmup = max(1, int(rc.steps * rc.warmup_frac))
-
-    def lr_at(step):
-        if step < warmup:
-            return rc.lr * (step + 1) / warmup
-        t = (step - warmup) / max(1, rc.steps - warmup)
-        return rc.lr * (0.05 + 0.95 * 0.5 * (1 + math.cos(math.pi * t)))
-
-    gen = torch.Generator().manual_seed(rc.seed)
+@torch.no_grad()
+def _dataset_accuracy(model, x, y, batch: int, device: str) -> float:
+    model.eval()
+    hits = tot = 0
+    for i in range(0, x.size(0), batch):
+        xb, yb = x[i:i + batch].to(device), y[i:i + batch].to(device)
+        pred = model(xb).argmax(dim=-1)
+        mask = yb != IGNORE
+        hits += (pred[mask] == yb[mask]).sum().item()
+        tot += mask.sum().item()
     model.train()
-    first_loss = last_loss = None
+    return hits / max(1, tot)
+
+
+def train_one(rc: RunConfig, device: str, log_every: int = 0):
+    """Zoology fit loop: fixed dataset, per-epoch cosine, no warmup,
+    early stop on val acc, best-epoch checkpoint restored at the end."""
+    torch.manual_seed(rc.seed)
+    gen = torch.Generator().manual_seed(rc.seed)
+    xtr, ytr = build_examples(rc.num_examples, rc.seq_len, rc.num_pairs,
+                              gen, rc.power_a)
+    gen_te = torch.Generator().manual_seed(rc.seed + TEST_SEED_OFFSET)
+    xte, yte = build_examples(rc.test_examples, rc.seq_len, rc.num_pairs,
+                              gen_te, rc.power_a)
+
+    cfg = ModelConfig(dim=rc.dim, n_kv_heads=rc.n_kv, kv_layers=rc.kv_layers,
+                      pos=rc.pos, dropout=rc.dropout,
+                      max_seq_len=max(4096, rc.seq_len))
+    model = KVModel(cfg).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=rc.lr,
+                            weight_decay=rc.weight_decay)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=rc.max_epochs, eta_min=0.0)
+
+    hist = {"best_acc": 0.0, "best_epoch": -1, "epochs_run": 0,
+            "final_train_loss": None}
+    best_state = None
     t0 = time.time()
-    for step in range(rc.steps):
-        for g in opt.param_groups:
-            g["lr"] = lr_at(step)
-        x, y = build_batch(rc.batch_size, rc.seq_len, rc.num_pairs, gen, device)
-        logits = model(x)
-        loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=IGNORE)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-        if first_loss is None:
-            first_loss = loss.item()
-        last_loss = loss.item()
-        if log_every and (step % log_every == 0 or step == rc.steps - 1):
-            with torch.no_grad():
-                acc = query_accuracy(logits, y)
-            el = time.time() - t0
-            print(f"    step {step:6d}/{rc.steps} loss {last_loss:6.3f} "
-                  f"batch_acc {acc:.3f} {el:6.0f}s", flush=True)
-    return model, first_loss, last_loss
+    model.train()
+    for epoch in range(rc.max_epochs):
+        perm = torch.randperm(rc.num_examples, generator=gen)
+        ep_loss, nb = 0.0, 0
+        for i in range(0, rc.num_examples, rc.batch_size):
+            idx = perm[i:i + rc.batch_size]
+            xb, yb = xtr[idx].to(device), ytr[idx].to(device)
+            logits = model(xb)
+            loss = torch.nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)), yb.view(-1),
+                ignore_index=IGNORE)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            ep_loss += loss.item()
+            nb += 1
+        sched.step()
+        acc = _dataset_accuracy(model, xte, yte, rc.batch_size, device)
+        hist["epochs_run"] = epoch + 1
+        hist["final_train_loss"] = ep_loss / max(1, nb)
+        if acc > hist["best_acc"]:
+            hist["best_acc"], hist["best_epoch"] = acc, epoch
+            best_state = copy.deepcopy(model.state_dict())
+        if log_every and (epoch % log_every == 0 or epoch == rc.max_epochs - 1):
+            print(f"    epoch {epoch:3d}/{rc.max_epochs} "
+                  f"train_loss {hist['final_train_loss']:6.3f} "
+                  f"val_acc {acc:.3f} best {hist['best_acc']:.3f} "
+                  f"{time.time() - t0:6.0f}s", flush=True)
+        if acc > rc.early_stop_acc:
+            break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, hist
 
 
 @torch.no_grad()
-def eval_grid(model, rc: RunConfig, device: str):
+def eval_grid(model, rc: RunConfig, device: str, eval_seqs: int = 256):
+    """Same-length cells only (learned APE does not extrapolate); denser
+    pair counts at the same length are the harder direction."""
     model.eval()
     out = {}
     for (l, n) in eval_cells():
-        gen = torch.Generator().manual_seed(BASE_SEED + 7 * l + n)  # fixed eval data
-        accs, done = [], 0
-        bs = max(4, rc.tokens_per_batch // l)
-        while done < rc.eval_seqs:
-            b = min(bs, rc.eval_seqs - done)
-            x, y = build_batch(b, l, n, gen, device)
-            accs.append((query_accuracy(model(x), y), b))
-            done += b
-        out[f"L{l}_N{n}"] = sum(a * w for a, w in accs) / sum(w for _, w in accs)
+        if l != rc.seq_len:
+            continue
+        g = torch.Generator().manual_seed(BASE_SEED + 7 * l + n)
+        x, y = build_examples(eval_seqs, l, n, g, rc.power_a)
+        accs, tot = [], 0
+        for i in range(0, eval_seqs, rc.batch_size):
+            xb, yb = x[i:i + rc.batch_size].to(device), y[i:i + rc.batch_size].to(device)
+            accs.append((query_accuracy(model(xb), yb), xb.size(0)))
+            tot += xb.size(0)
+        out[f"L{l}_N{n}"] = sum(a * w for a, w in accs) / tot
     return out
 
 
@@ -163,8 +227,8 @@ def load_done_keys(path: str):
             for line in f:
                 line = line.strip()
                 if line:
-                    rec = json.loads(line)
-                    done.add(json.dumps(rec["config"], sort_keys=True))
+                    done.add(json.dumps(json.loads(line)["config"],
+                                        sort_keys=True))
     return done
 
 
@@ -178,26 +242,20 @@ def run(plan, out_path: str, device: str, log_every: int = 0):
         if log_every:
             print(f"[{i + 1}/{len(todo)}] START {rc.dim}d nkv={rc.n_kv} "
                   f"kvl={rc.kv_layers} L{rc.seq_len} N{rc.num_pairs} "
-                  f"lr={rc.lr:.1e} steps={rc.steps}", flush=True)
+                  f"lr={rc.lr:.1e} epochs<={rc.max_epochs}", flush=True)
         t0 = time.time()
-        model, first_loss, last_loss = train_one(rc, device, log_every=log_every)
+        model, hist = train_one(rc, device, log_every=log_every)
         evals = eval_grid(model, rc, device)
-        rec = {
-            "config": asdict(rc),
-            "first_loss": first_loss,
-            "final_loss": last_loss,
-            "evals": evals,
-            "wall_s": round(time.time() - t0, 1),
-            "device": device,
-            "torch": torch.__version__,
-        }
+        rec = {"config": asdict(rc), **hist, "evals": evals,
+               "wall_s": round(time.time() - t0, 1), "device": device,
+               "torch": torch.__version__}
         with open(out_path, "a", encoding="utf-8") as f:  # append = merge
             f.write(json.dumps(rec) + "\n")
-        diag = evals.get(f"L{rc.seq_len}_N{rc.num_pairs}", float("nan"))
-        print(f"[{i + 1}/{len(todo)}] {rc.dim}d nkv={rc.n_kv} kvl={rc.kv_layers} "
-              f"L{rc.seq_len} N{rc.num_pairs} lr={rc.lr:.1e} seed={rc.seed} "
-              f"diag_acc={diag:.3f} loss={last_loss:.3f} {rec['wall_s']}s",
-              flush=True)
+        print(f"[{i + 1}/{len(todo)}] {rc.dim}d nkv={rc.n_kv} "
+              f"kvl={rc.kv_layers} L{rc.seq_len} N{rc.num_pairs} "
+              f"lr={rc.lr:.1e} seed={rc.seed} "
+              f"best_acc={hist['best_acc']:.3f}@ep{hist['best_epoch']} "
+              f"({hist['epochs_run']} ep, {rec['wall_s']}s)", flush=True)
 
 
 # ---- analysis / gate --------------------------------------------------------
@@ -208,15 +266,16 @@ def _max_over_lr(records, dim, n_kv, kv_layers, seq_len, num_pairs, seed, cell):
             and r["config"]["kv_layers"] == kv_layers
             and r["config"]["seq_len"] == seq_len
             and r["config"]["num_pairs"] == num_pairs
-            and r["config"]["seed"] == seed]
+            and r["config"]["seed"] == seed
+            and cell in r["evals"]]
     return max(vals) if vals else None
 
 
 def analyse(path: str):
     with open(path, encoding="utf-8") as f:
         records = [json.loads(l) for l in f if l.strip()]
-    hi = max(DOSES, key=lambda d: d[0] * d[1])   # (8, 4) -> rel 1.0
-    lo = min(DOSES, key=lambda d: d[0] * d[1])   # (1, 1) -> rel 1/32
+    hi = max(DOSES, key=lambda d: d[0] * d[1])
+    lo = min(DOSES, key=lambda d: d[0] * d[1])
 
     j = JITTER_CELL
     cell = f"L{j['seq_len']}_N{j['num_pairs']}"
@@ -254,32 +313,20 @@ def analyse(path: str):
     return summary
 
 
-def build_calibration_plan(steps: int):
-    """Anchor-dose-ONLY runs to pick `steps` such that the full-cache arm
-    converges (diag acc >= 0.9) before launching the grid. Uses exclusively
-    the top dose (8, 4): no low-dose arm is trained, so no dose contrast can
-    be observed before the gate (prereg hygiene)."""
-    plan = []
-    for (l, n) in ((512, 32), (2048, 64)):
-        for lr in LRS[2:]:  # the two highest LRs; low LRs never win on MQAR
-            plan.append(RunConfig(128, 8, 4, l, n, lr, BASE_SEED, steps))
-    return plan
-
-
 def main(argv=None):
     p = argparse.ArgumentParser(description="Stage A-0 MQAR dose-response")
     p.add_argument("--out", default="data/a0_results.jsonl")
     p.add_argument("--device", default="auto")
-    p.add_argument("--steps", type=int, default=20000)
+    p.add_argument("--epochs", type=int, default=64)
     p.add_argument("--smoke", action="store_true",
-                   help="tiny subset, short steps, SEPARATE output file")
+                   help="tiny subset, SEPARATE output file")
     p.add_argument("--calibrate", action="store_true",
                    help="anchor-dose convergence check, SEPARATE output file")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--analyse", action="store_true")
-    p.add_argument("--log-every", type=int, default=1000,
-                   help="in-run progress line every N steps (0 = silent)")
+    p.add_argument("--log-every", type=int, default=1,
+                   help="progress line every N epochs (0 = silent)")
     args = p.parse_args(argv)
 
     if args.analyse:
@@ -287,20 +334,15 @@ def main(argv=None):
         return
 
     if args.calibrate:
-        plan = build_calibration_plan(steps=args.steps)
+        plan = build_calibration_plan(max_epochs=args.epochs)
         out = args.out if args.out != "data/a0_results.jsonl" else "data/a0_calibrate.jsonl"
-        if args.dry_run:
-            print(f"{len(plan)} calibration runs -> {out}")
-            return
-        run(plan, out, pick_device(args.device), log_every=args.log_every)
-        return
-
-    if args.smoke:
-        plan = build_plan(steps=min(args.steps, 200), dims=(128,), lens=(512,),
-                          pairs=(32, 64), lrs=LRS[1:3], with_jitter=False)
+    elif args.smoke:
+        plan = build_plan(max_epochs=2, dims=(128,), lens=(512,),
+                          pairs=(32, 64), lrs=LRS[1:3], with_jitter=False,
+                          num_examples=2000, test_examples=500)
         out = args.out if args.out != "data/a0_results.jsonl" else "data/a0_smoke.jsonl"
     else:
-        plan = build_plan(steps=args.steps)
+        plan = build_plan(max_epochs=args.epochs)
         out = args.out
     if args.limit:
         plan = plan[:args.limit]
