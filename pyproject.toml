@@ -1,0 +1,30 @@
+[project]
+name = "kvalloc"
+version = "0.1.0"
+description = "KV-cache allocation law — controlled from-scratch study (G0-A)"
+readme = "README.md"
+# Same window as fertility-precision: the A6000 box runs 3.11/3.12 and uv
+# resolves inside it; widening invites a silent wheel change mid-project.
+requires-python = ">=3.11,<3.13"
+# torch sits in the base deps (not a `gpu` extra as in fertility-precision)
+# because every stage of THIS repo trains — there is no tokenizer-only stage.
+dependencies = [
+    "numpy>=2.4.6",
+    "torch>=2.5",
+]
+
+[project.scripts]
+kvalloc = "kvalloc.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kvalloc"]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
