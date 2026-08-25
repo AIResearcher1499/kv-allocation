@@ -24,6 +24,12 @@
     "num_examples stays 100000 (proven recipe)."
   ],
   "anchor_convergence_pending": "N64 and N128 anchors not yet demonstrated; the grid itself provides them (anchor dose is part of the grid). If the anchor fails on N64 AND N128, only N32 supports the gate -> insufficient cells; stop and re-plan per prereg section 7.",
+  "amendment_2026-08-25_gate_sign": {
+    "when_noticed": "after exactly 3 grid records existed (gpu0 lines 1-3): anchor N32 0.992, anchor N128 0.010, floor(1,1)-N64 0.993 vs anchor-N64 0.016 — an INVERTED dose-response on N64",
+    "ambiguity": "prereg gate text 'range >= 15 accuracy points between largest and smallest byte budget' does not state a direction; the code had implemented the signed (more-bytes-better) reading",
+    "resolution": "signed reading stays PRIMARY (letter of the pre-data implementation); analyse() additionally reports the absolute reading. An inversion-driven result is treated as a registered surprise requiring its own verification (kv_layers=1 arms vs (1,4) arm discriminate the raw-embedding-KV mechanism), not as a gate pass.",
+    "integrity_note": "recorded immediately upon noticing, before floor-N32 or any mid-ladder run completed"
+  },
   "hardware": "2026-08-25: A6000s run 82-86C under load (poor case cooling); GPU power limit may be capped (e.g. nvidia-smi -pl 230) at any time, including mid-grid. No A-0/A-1 endpoint gates on wall-clock or throughput, so this changes nothing scientific; wall_s fields are provenance only and must not be compared across different power-limit settings. Record the actual -pl value and change time in logs/ when applied.",
   "note": "All items here are implementation parameters or pre-authorized instrument-scale decisions; no frozen threshold in docs/prereg-g0a.md is altered."
 }

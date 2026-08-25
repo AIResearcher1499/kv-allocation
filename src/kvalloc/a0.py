@@ -303,15 +303,28 @@ def analyse(path: str):
             if top is None or bot is None:
                 continue
             rng = top - bot
-            ok = (rng >= 0.15) and (jitter is not None and rng > jitter)
-            if ok:
+            # Sign ambiguity, documented 2026-08-25 in data/a0_config_lock.json
+            # AFTER 3 grid records existed (floor arm beating the anchor on
+            # N64 revealed it): the frozen text says "range >= 15 points
+            # between largest and smallest byte budget" without a direction.
+            # PRIMARY = signed reading (as originally coded, letter of the
+            # implementation); the absolute reading is reported alongside and
+            # an inverted dose-response is a registered surprise, not a pass.
+            ok_signed = (rng >= 0.15) and (jitter is not None and rng > jitter)
+            ok_abs = (abs(rng) >= 0.15) and (jitter is not None and abs(rng) > jitter)
+            if ok_signed:
                 # gate counts DISTINCT (len x pairs) task cells, not dim variants
                 passing_cells.add(cell)
             rows.append({"dim": dim, "cell": cell, "acc_hi": top,
-                         "acc_lo": bot, "range": rng, "passes": ok})
+                         "acc_lo": bot, "range": rng,
+                         "passes": ok_signed, "passes_abs": ok_abs})
     saturated = all(r["acc_hi"] > 0.95 and r["acc_lo"] > 0.95 for r in rows) if rows else False
+    abs_cells = {r["cell"] for r in rows if r["passes_abs"]}
     summary = {"jitter": jitter, "cells_passing": len(passing_cells),
-               "gate_a0": len(passing_cells) >= 2, "all_saturated": saturated,
+               "gate_a0": len(passing_cells) >= 2,
+               "cells_passing_abs": len(abs_cells),
+               "gate_a0_absolute_reading": len(abs_cells) >= 2,
+               "all_saturated": saturated,
                "rows": rows}
     print(json.dumps({k: v for k, v in summary.items() if k != "rows"}, indent=2))
     for r in sorted(rows, key=lambda r: -r["range"])[:12]:
