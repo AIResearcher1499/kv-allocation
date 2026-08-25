@@ -1,0 +1,28 @@
+{
+  "locked": "2026-08-25",
+  "protocol": "v2 Zoology-faithful (commit 3fca65c): fixed dataset, per-epoch cosine, no warmup, learned APE, dropout 0.1, power_a 0.01, early stop val_acc > 0.99",
+  "grid": {
+    "dims": [128],
+    "lens": [512],
+    "pairs_gate_cells": [[512, 32], [512, 64], [512, 128]],
+    "num_examples": 100000,
+    "max_epochs": 48,
+    "lrs": "all 4 frozen sweep points",
+    "jitter_cell": {"dim": 128, "n_kv": 2, "kv_layers": 2, "seq_len": 512, "num_pairs": 64}
+  },
+  "evidence": {
+    "anchor_512_32_lr2.15e-3": "best_acc 0.9994 @ epoch 29 (100k examples)",
+    "anchor_512_32_lr1e-2": "best_acc 0.9994 @ epoch 19 (100k examples)",
+    "anchor_2048_64_lr2.15e-3": "val_acc 0.013 @ epoch 40, LR decayed -> cell dead at this budget; run aborted, logs/calibrate_v2 log is the record",
+    "anchor_512_32_20k_examples": "flat at chance through epoch 16 -> 20k-lever rejected: breakout is governed by optimization steps (~15k at 100k-run), per-epoch cosine at 20k decays LR 5x faster per step; equal-step cost equals 100k. Aborted."
+  },
+  "decisions": [
+    "L2048/L4096 cells excluded from the gate grid (anchor dead); they remain frozen grid members and move to post-GO exploratory work.",
+    "dim 256 deferred to post-GO (cost); gate judged on dim 128 rows only.",
+    "max_epochs 64 -> 48 for the grid: latest observed anchor breakout is epoch 29; T_max change applies identically to every arm, so dose comparisons stay internally consistent.",
+    "jitter cell moved from 2048/128 (dead length) to 512/64.",
+    "num_examples stays 100000 (proven recipe)."
+  ],
+  "anchor_convergence_pending": "N64 and N128 anchors not yet demonstrated; the grid itself provides them (anchor dose is part of the grid). If the anchor fails on N64 AND N128, only N32 supports the gate -> insufficient cells; stop and re-plan per prereg section 7.",
+  "note": "All items here are implementation parameters or pre-authorized instrument-scale decisions; no frozen threshold in docs/prereg-g0a.md is altered."
+}

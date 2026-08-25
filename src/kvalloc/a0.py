@@ -339,6 +339,8 @@ def main(argv=None):
                    help="calibrate only: 'L:N,L:N' cells at the top LR")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--shard", default="",
+                   help="'i/n': run every n-th job starting at i (2-GPU split)")
     p.add_argument("--analyse", action="store_true")
     p.add_argument("--log-every", type=int, default=1,
                    help="progress line every N epochs (0 = silent)")
@@ -368,6 +370,9 @@ def main(argv=None):
         plan = build_plan(max_epochs=args.epochs, dims=dims, lens=lens,
                           num_examples=args.num_examples)
         out = args.out
+    if args.shard:
+        i, n = (int(v) for v in args.shard.split("/"))
+        plan = plan[i::n]
     if args.limit:
         plan = plan[:args.limit]
     if args.dry_run:
