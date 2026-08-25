@@ -370,6 +370,12 @@ def main(argv=None):
         plan = build_plan(max_epochs=args.epochs, dims=dims, lens=lens,
                           num_examples=args.num_examples)
         out = args.out
+    # Informative-first ordering (cost-neutral, resume-safe): high LRs first
+    # (low LRs never won on MQAR and mostly burn full max_epochs), and within
+    # an LR the extreme doses first — so the dose-response headline is
+    # readable after ~1 day instead of after the whole grid.
+    dose_rank = {(8, 4): 0, (1, 1): 0}
+    plan.sort(key=lambda rc: (-rc.lr, dose_rank.get((rc.n_kv, rc.kv_layers), 1)))
     if args.shard:
         i, n = (int(v) for v in args.shard.split("/"))
         plan = plan[i::n]
