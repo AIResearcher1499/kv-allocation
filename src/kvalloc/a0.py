@@ -38,7 +38,10 @@ TRAIN_LENS = (512, 2048, 4096)
 PAIRS = (32, 64, 128, 256)
 LRS = (1e-4, 4.6415888336127824e-4, 2.1544346900318823e-3, 1e-2)
 BASE_SEED = 20260824
-JITTER_CELL = dict(dim=128, n_kv=2, kv_layers=2, seq_len=2048, num_pairs=128)
+# Jitter cell moved 2048/128 -> 512/64 (2026-08-25): calibration showed the
+# L2048 anchor never converges at this budget, and jitter measured on a dead
+# cell estimates nothing. Recorded in data/config_lock.json.
+JITTER_CELL = dict(dim=128, n_kv=2, kv_layers=2, seq_len=512, num_pairs=64)
 JITTER_SEED_OFFSET = 1000
 TEST_SEED_OFFSET = 10_000_019  # train/test example streams must not overlap
 # -----------------------------------------------------------------------------
@@ -106,12 +109,14 @@ def build_plan(max_epochs: int = 64, dims=DIMS, lens=TRAIN_LENS, pairs=PAIRS,
     return plan
 
 
-def build_calibration_plan(max_epochs: int = 64, **overrides):
+def build_calibration_plan(max_epochs: int = 64,
+                           cells=((512, 32), (2048, 64)),
+                           lrs=LRS[2:], **overrides):
     """Anchor-dose-ONLY runs to verify the instrument converges before the
     grid. Trains no low-dose arm, so no dose contrast is visible pre-gate."""
     plan = []
-    for (l, n) in ((512, 32), (2048, 64)):
-        for lr in LRS[2:]:
+    for (l, n) in cells:
+        for lr in lrs:
             plan.append(RunConfig(128, 8, 4, l, n, lr, BASE_SEED,
                                   max_epochs, **overrides))
     return plan
@@ -330,6 +335,8 @@ def main(argv=None):
                    help="tiny subset, SEPARATE output file")
     p.add_argument("--calibrate", action="store_true",
                    help="anchor-dose convergence check, SEPARATE output file")
+    p.add_argument("--cal-cells", default="",
+                   help="calibrate only: 'L:N,L:N' cells at the top LR")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--analyse", action="store_true")
@@ -342,7 +349,13 @@ def main(argv=None):
         return
 
     if args.calibrate:
-        plan = build_calibration_plan(max_epochs=args.epochs)
+        kw = {}
+        if args.cal_cells:
+            kw["cells"] = tuple(tuple(int(v) for v in c.split(":"))
+                                for c in args.cal_cells.split(","))
+            kw["lrs"] = (LRS[3],)  # fastest-converging LR (1e-2, ep19 on N32)
+        plan = build_calibration_plan(max_epochs=args.epochs,
+                                      num_examples=args.num_examples, **kw)
         out = args.out if args.out != "data/a0_results.jsonl" else "data/a0_calibrate.jsonl"
     elif args.smoke:
         plan = build_plan(max_epochs=2, dims=(128,), lens=(512,),

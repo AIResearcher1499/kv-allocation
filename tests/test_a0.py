@@ -101,9 +101,9 @@ class TestAnalyse(unittest.TestCase):
             return analyse(path)
 
     def _jitter_pair(self):
-        return [self._rec(2, 2, BASE_SEED, 0.70, l=2048, n=128),
+        return [self._rec(2, 2, BASE_SEED, 0.70, l=512, n=64),
                 self._rec(2, 2, BASE_SEED + JITTER_SEED_OFFSET, 0.72,
-                          l=2048, n=128)]
+                          l=512, n=64)]
 
     def test_gate_math_on_synthetic_records(self):
         hi = max(DOSES, key=lambda d: d[0] * d[1])
