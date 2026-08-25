@@ -24,5 +24,6 @@
     "num_examples stays 100000 (proven recipe)."
   ],
   "anchor_convergence_pending": "N64 and N128 anchors not yet demonstrated; the grid itself provides them (anchor dose is part of the grid). If the anchor fails on N64 AND N128, only N32 supports the gate -> insufficient cells; stop and re-plan per prereg section 7.",
+  "hardware": "2026-08-25: A6000s run 82-86C under load (poor case cooling); GPU power limit may be capped (e.g. nvidia-smi -pl 230) at any time, including mid-grid. No A-0/A-1 endpoint gates on wall-clock or throughput, so this changes nothing scientific; wall_s fields are provenance only and must not be compared across different power-limit settings. Record the actual -pl value and change time in logs/ when applied.",
   "note": "All items here are implementation parameters or pre-authorized instrument-scale decisions; no frozen threshold in docs/prereg-g0a.md is altered."
 }
