@@ -274,6 +274,9 @@ def _max_over_lr(records, dim, n_kv, kv_layers, seq_len, num_pairs, seed, cell):
 def analyse(path: str):
     with open(path, encoding="utf-8") as f:
         records = [json.loads(l) for l in f if l.strip()]
+    # v1 (fresh-data/RoPE) records lack the `pos` field — never let them mix
+    # into the gate (data/ may hold both formats side by side).
+    records = [r for r in records if r["config"].get("pos") == "learned"]
     hi = max(DOSES, key=lambda d: d[0] * d[1])
     lo = min(DOSES, key=lambda d: d[0] * d[1])
 
@@ -318,6 +321,11 @@ def main(argv=None):
     p.add_argument("--out", default="data/a0_results.jsonl")
     p.add_argument("--device", default="auto")
     p.add_argument("--epochs", type=int, default=64)
+    p.add_argument("--num-examples", type=int, default=100_000)
+    p.add_argument("--lens", default="512,2048,4096",
+                   help="comma list of train seq lens to include")
+    p.add_argument("--dims", default="128,256",
+                   help="comma list of model dims to include")
     p.add_argument("--smoke", action="store_true",
                    help="tiny subset, SEPARATE output file")
     p.add_argument("--calibrate", action="store_true",
@@ -342,7 +350,10 @@ def main(argv=None):
                           num_examples=2000, test_examples=500)
         out = args.out if args.out != "data/a0_results.jsonl" else "data/a0_smoke.jsonl"
     else:
-        plan = build_plan(max_epochs=args.epochs)
+        lens = tuple(int(x) for x in args.lens.split(","))
+        dims = tuple(int(x) for x in args.dims.split(","))
+        plan = build_plan(max_epochs=args.epochs, dims=dims, lens=lens,
+                          num_examples=args.num_examples)
         out = args.out
     if args.limit:
         plan = plan[:args.limit]
